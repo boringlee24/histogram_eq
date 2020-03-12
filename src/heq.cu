@@ -262,9 +262,9 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
         checkCuda(cudaPeekAtLastError());                                     
         checkCuda(cudaDeviceSynchronize());
 
-    prefix_sum<<<dimGrid, dimBlock>>>(probability_vector, cdf_cpu_test_gpu, bucket_count);
+    //prefix_sum<<<dimGrid, dimBlock>>>(probability_vector, cdf_cpu_test_gpu, bucket_count);
 
-    checkCuda(cudaMemcpy(cdf_cpu_test, cdf_cpu_test_gpu,bucket_count*sizeof(double),cudaMemcpyDeviceToHost));
+    //checkCuda(cudaMemcpy(cdf_cpu_test, cdf_cpu_test_gpu,bucket_count*sizeof(double),cudaMemcpyDeviceToHost));
 
 	checkCuda(cudaMemcpy(probability_cpu_double,probability_vector,bucket_count*sizeof(double),cudaMemcpyDeviceToHost));
 	/*
@@ -296,19 +296,20 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
 */	
 	//double count = probability_cpu_double[0];
 	cdf_cpu[0]= probability_cpu_double[0];
-    printf("difference = %d\n", cdf_cpu[0] - cdf_cpu_test[0]);
-   
+    ////printf("at 0, cdf = %f, cdf_test = %f\n", cdf_cpu[0], cdf_cpu_test[0]);
+    printf("at 0, cdf = %f\n", cdf_cpu[0]);
+  
 	for(int i=1;i<bucket_count;i++)
 	{
 		cdf_cpu[i] = probability_cpu_double[i]+cdf_cpu[i-1];		
 		//count = count+ probability_cpu_double[i];
-        printf("difference = %d\n", cdf_cpu[i] - cdf_cpu_test[i]);
+        printf("at %d, cdf = %f\n", i, cdf_cpu[i]);
 	}
 
-	double offset, range,alpha;
+    double offset, range,alpha;
 	offset = cdf_cpu[0];
 	range = cdf_cpu[bucket_count-1]-cdf_cpu[0];
-	alpha = 1/range;
+	alpha = 1/range; 
 	
 /*	
 	for(int i= 0;i<256;i++)
@@ -400,4 +401,5 @@ void gpu_warmup(unsigned char *data, unsigned int height,unsigned int width){
 			
 	
 }
+
 

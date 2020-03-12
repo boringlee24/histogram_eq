@@ -71,23 +71,32 @@ __global__ void probability_function(unsigned int *input, double *output, unsign
 	}
 }
 
-__global__ void frequency_function(unsigned char *input, unsigned int *output, int bucket_size)
+__global__ void frequency_function(unsigned char *input, unsigned int *output,int size, int bucket_size)
 {
 
     int x = blockIdx.x*TILE_SIZE+threadIdx.x;
     int y = blockIdx.y*TILE_SIZE+threadIdx.y;
 
     int location = 	y*TILE_SIZE*gridDim.x+x;
-   
+   /* 
 	unsigned char value = input[location];
 	int buck = ((int)value)/bucket_size;
-    printf("location = %d value = %d\n", location, buck);
 
     output[buck] += 1;
+*/
+
+	if (location < (size))
+    	{
+        	atomicAdd(&output[(unsigned int)(input[location])], 1);
+        	//atomicAdd(&output[(unsigned int)(input[location] & 0xFF000000)], 1);
+        	//atomicAdd(&output[(unsigned int)(input[location] & 0x00FF0000)], 1);
+        	//atomicAdd(&output[(unsigned int)(input[location] & 0x0000FF00)], 1);
+        	//atomicAdd(&output[(unsigned int)(input[location] & 0x000000FF)], 1);
+    	}	
 
 }
 
-__global__ void cdf_normalization(double *input,double *output,float alpha, int bucket_count)
+__global__ void cdf_normalization(double *input,double *output,int count, int bucket_count, double offset, double alpha)
 {
 
     	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
@@ -98,45 +107,12 @@ __global__ void cdf_normalization(double *input,double *output,float alpha, int 
 	if (location <bucket_count)
 	{
 		double value = input[location];
-		output[location]=alpha*value;
+		output[location]=(value-offset)*(bucket_count-1)*alpha;
 	}
 }
 
 
-__global__ void equalization(double *input,double *cdf, double *output, int bucket_count)
-{
-
-    	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
-    	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
-
-    	int location = 	y*TILE_SIZE*gridDim.x+x;
-    
-	if (location <bucket_count)
-	{
-		int value = (int)cdf[location];
-		output[value]+= input[location];
-	}
-}
-
-
-__global__ void final_equalization(double *input, double *output, int bucket_count)
-{
-
-    	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
-    	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
-
-    	int location = 	y*TILE_SIZE*gridDim.x+x;
-    
-	if (location <bucket_count)
-	{
-		double value = input[location];
-		output[location]=value*255;
-	}
-}
-
-
-
-__global__ void final_output(unsigned char *input,unsigned char *output, double *temp,int bucket_size)
+__global__ void final_output(unsigned char *input,unsigned char *output,double *cdf,int bucket_size)
 {
 
 	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
@@ -145,8 +121,8 @@ __global__ void final_output(unsigned char *input,unsigned char *output, double 
 	int location = 	y*TILE_SIZE*gridDim.x+x;
     
 	unsigned char value = input[location];
-	int buck = (int(value)/bucket_size);
-	output[location]=temp[buck];
+	int buck =(int)value; 
+	output[location]=cdf[buck];
 
 }
 
@@ -191,11 +167,7 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
 	double cdf_cpu[bucket_count];
 	double *cdf_norm;
 	unsigned int frequency_cpu[bucket_count];
-	double *eq_hist;
-	double *final_eq;
-	double *lut;
-	double lut_cpu[256];
-
+	
 	//int length = sizeof(data)/sizeof(data[0]);
 	//printf("LENGTH == %d\n",length);
 	// Allocate arrays in GPU memory
@@ -205,12 +177,6 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
 	checkCuda(cudaMalloc((void**)&cdf_vector  , bucket_count*sizeof(double)));
         checkCuda(cudaMalloc((void**)&frequency_vector  , bucket_count*sizeof(unsigned int)));
 	checkCuda(cudaMalloc((void**)&cdf_norm,bucket_count*sizeof(double)));
-	checkCuda(cudaMalloc((void**)&eq_hist,bucket_count*sizeof(double)));
-	checkCuda(cudaMalloc((void**)&final_eq,bucket_count*sizeof(double)));
-	checkCuda(cudaMalloc((void**)&lut,bucket_count*sizeof(double)));
-
-
-
 /*
 	for(int i=0;i<width*height;i++)
 	{
@@ -229,15 +195,11 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
 		probability_cpu_double[i]=0;
 	}	
 
-	
     	// Copy data to GPU
     	checkCuda(cudaMemcpy(input_gpu, data,size*sizeof(char), cudaMemcpyHostToDevice));
 	checkCuda(cudaMemset(output_gpu , 0 , size*sizeof(unsigned char)));
 	checkCuda(cudaMemcpy(probability_vector,probability_cpu_double,bucket_count*sizeof(double),cudaMemcpyHostToDevice));
 	checkCuda(cudaMemcpy(frequency_vector,probability_cpu_int,bucket_count*sizeof(unsigned int),cudaMemcpyHostToDevice));
-	checkCuda(cudaMemcpy(eq_hist,probability_cpu_double,bucket_count*sizeof(double),cudaMemcpyHostToDevice));
-
-
 
 	checkCuda(cudaDeviceSynchronize());
 
@@ -255,29 +217,17 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
         
         // Add more kernels and functions as needed here
         //norm_function<<<dimGrid, dimBlock>>>(input_gpu, output_gpu,width,height);
-	frequency_function<<<dimGrid, dimBlock>>>(input_gpu,frequency_vector, bucket_size);
+	frequency_function<<<dimGrid, dimBlock>>>(input_gpu,frequency_vector,size, bucket_size);
         
 	checkCuda(cudaMemcpy(frequency_cpu,frequency_vector,bucket_count*sizeof(unsigned int),cudaMemcpyDeviceToHost));
 	
-//	int count = 4990464;
-    int count = 0;
+	int count = 0;
 	for(int i=0;i<bucket_count;i++)
 	{
 		count += frequency_cpu[i];
 	} 
 
 	printf("LENGTH = %d\n",count);
-	
-	float alpha = 255/count;	
-
-	lut_cpu[0]=frequency_cpu[0];
-	for(int i=0;i<256;i++)
-	{
-		lut_cpu[i]= lut_cpu[i-1]+ alpha*(float)frequency_cpu[i];
-	}
-
-	checkCuda(cudaMemcpy(lut,lut_cpu,bucket_count*sizeof(double),cudaMemcpyDeviceToHost));
-/*
 	probability_function<<<dimGrid, dimBlock>>>(frequency_vector,probability_vector,count,bucket_count);
 	
         // From here on, no need to change anything
@@ -285,7 +235,7 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
         checkCuda(cudaDeviceSynchronize());
 	
 	checkCuda(cudaMemcpy(probability_cpu_double,probability_vector,bucket_count*sizeof(double),cudaMemcpyDeviceToHost));
-
+	/*
 	int min;
 
 	for(int i=0;i<256;i++)
@@ -311,7 +261,7 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
 	}
 	
 	printf("MAX = %d",max);
-	
+*/	
 	//double count = probability_cpu_double[0];
 	cdf_cpu[0]= probability_cpu_double[0];
 	for(int i=1;i<bucket_count;i++)
@@ -319,7 +269,13 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
 		cdf_cpu[i] = probability_cpu_double[i]+cdf_cpu[i-1];		
 		//count = count+ probability_cpu_double[i];
 	}
+
+	double offset, range,alpha;
+	offset = cdf_cpu[0];
+	range = cdf_cpu[bucket_count-1]-cdf_cpu[0];
+	alpha = 1/range;
 	
+/*	
 	for(int i= 0;i<256;i++)
 	{
 		printf("probability[%d]=%lf \n",i,probability_cpu_double[i]);
@@ -334,15 +290,11 @@ void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
 */	
 	//printf("COUNT = %lf\n",count);
 
-//	checkCuda(cudaMemcpy(cdf_vector,cdf_cpu,bucket_count*sizeof(double),cudaMemcpyHostToDevice));
+	checkCuda(cudaMemcpy(cdf_vector,cdf_cpu,bucket_count*sizeof(double),cudaMemcpyHostToDevice));
 
-//	cdf_normalization<<<dimGrid, dimBlock>>>(cdf_vector,cdf_norm,alpha, bucket_count);
+	cdf_normalization<<<dimGrid, dimBlock>>>(cdf_vector,cdf_norm,size, bucket_count, offset, alpha);
 
-//	equalization<<<dimGrid, dimBlock>>>(probability_vector, cdf_norm, eq_hist,bucket_count);
-
-//	final_equalization<<<dimGrid,dimBlock>>>(eq_hist,final_eq,bucket_count);
-
-	final_output<<<dimGrid,dimBlock>>>(input_gpu,output_gpu,lut, bucket_size);
+	final_output<<<dimGrid,dimBlock>>>(input_gpu,output_gpu, cdf_norm, bucket_size);
 	#ifdef CUDA_TIMING
 		TIMER_END(Ktime);
 		printf("Kernel Execution Time: %f ms\n", Ktime);
