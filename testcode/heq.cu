@@ -1,0 +1,416 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda.h>
+#include <time.h>
+ 
+#include "config.h"
+
+#define TIMER_CREATE(t)               \
+  cudaEvent_t t##_start, t##_end;     \
+  cudaEventCreate(&t##_start);        \
+  cudaEventCreate(&t##_end);               
+ 
+#define TIMER_START(t)                \
+  cudaEventRecord(t##_start);         \
+  cudaEventSynchronize(t##_start);    \
+ 
+#define TIMER_END(t)                             \
+  cudaEventRecord(t##_end);                      \
+  cudaEventSynchronize(t##_end);                 \
+  cudaEventElapsedTime(&t, t##_start, t##_end);  \
+  cudaEventDestroy(t##_start);                   \
+  cudaEventDestroy(t##_end);     
+
+/*******************************************************/
+/*                 Cuda Error Function                 */
+/*******************************************************/
+inline cudaError_t checkCuda(cudaError_t result) {
+	#if defined(DEBUG) || defined(_DEBUG)
+		if (result != cudaSuccess) {
+			fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+			exit(-1);
+		}
+	#endif
+		return result;
+}
+                
+// Add GPU kernel and functions
+// HERE!!!
+__global__ void probability_func(unsigned char *input, 
+                       unsigned char *output,
+                       unsigned int width,
+                       unsigned int height){
+
+    int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+    int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+
+    int location = 	y*TILE_SIZE*gridDim.x+x;
+    
+	unsigned char value = input[location];
+
+
+    output[location] = x%255;
+
+}
+
+__global__ void probability_function(unsigned int *input, double *output, unsigned int size, int bucket_count)
+{
+
+	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+    	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+
+    	//int size = height*width;
+    	int location = y*TILE_SIZE*gridDim.x+x;
+    	if(location<bucket_count)
+	{
+		//printf("initial[%d]=%d\n",location,input[location]);
+		double value = input[location];
+                output[location] =value/size;
+		//printf("probability[%d]=%lf\n",location,value/size);
+	}
+}
+
+__global__ void frequency_function(unsigned char *input, unsigned int *output, int bucket_size)
+{
+
+    int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+    int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+
+    int location = 	y*TILE_SIZE*gridDim.x+x;
+   
+	unsigned char value = input[location];
+	int buck = ((int)value)/bucket_size;
+    printf("location = %d value = %d\n", location, buck);
+
+    output[buck] += 1;
+
+}
+
+__global__ void cdf_normalization(double *input,double *output,float alpha, int bucket_count)
+{
+
+    	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+    	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+
+    	int location = 	y*TILE_SIZE*gridDim.x+x;
+    
+	if (location <bucket_count)
+	{
+		double value = input[location];
+		output[location]=alpha*value;
+	}
+}
+
+
+__global__ void equalization(double *input,double *cdf, double *output, int bucket_count)
+{
+
+    	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+    	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+
+    	int location = 	y*TILE_SIZE*gridDim.x+x;
+    
+	if (location <bucket_count)
+	{
+		int value = (int)cdf[location];
+		output[value]+= input[location];
+	}
+}
+
+
+__global__ void final_equalization(double *input, double *output, int bucket_count)
+{
+
+    	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+    	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+
+    	int location = 	y*TILE_SIZE*gridDim.x+x;
+    
+	if (location <bucket_count)
+	{
+		double value = input[location];
+		output[location]=value*255;
+	}
+}
+
+
+
+__global__ void final_output(unsigned char *input,unsigned char *output, double *temp,int bucket_size)
+{
+
+	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+
+	int location = 	y*TILE_SIZE*gridDim.x+x;
+    
+	unsigned char value = input[location];
+	int buck = (int(value)/bucket_size);
+	output[location]=temp[buck];
+
+}
+
+
+
+
+__global__ void warmup(unsigned char *input,unsigned char *output)
+{
+
+	int x = blockIdx.x*TILE_SIZE+threadIdx.x;
+	int y = blockIdx.y*TILE_SIZE+threadIdx.y;
+	  
+	int location = 	y*(gridDim.x*TILE_SIZE)+x;
+	
+	output[location] = 0;
+
+}
+
+// NOTE: The data passed on is already padded
+void gpu_function(unsigned char *data,unsigned int height,unsigned int width)
+{
+
+	int gridXSize = 1 + (( width - 1) / TILE_SIZE);
+	int gridYSize = 1 + ((height - 1) / TILE_SIZE);
+	
+	int XSize = gridXSize*TILE_SIZE;
+	int YSize = gridYSize*TILE_SIZE;
+	
+	int size = XSize*YSize;
+
+	int bucket_count = 256;
+	int bucket_size = 1;	
+	//int max = 255/size;
+	
+	unsigned char *input_gpu;
+	unsigned char *output_gpu;
+	double *probability_vector;
+	unsigned int *frequency_vector;
+	double *cdf_vector;
+	double probability_cpu_double[bucket_count];
+	unsigned int probability_cpu_int[bucket_count];
+	double cdf_cpu[bucket_count];
+	double *cdf_norm;
+	unsigned int frequency_cpu[bucket_count];
+	double *eq_hist;
+	double *final_eq;
+	double *lut;
+	double lut_cpu[256];
+
+	//int length = sizeof(data)/sizeof(data[0]);
+	//printf("LENGTH == %d\n",length);
+	// Allocate arrays in GPU memory
+	checkCuda(cudaMalloc((void**)&input_gpu   , size*sizeof(unsigned char)));
+	checkCuda(cudaMalloc((void**)&output_gpu  , size*sizeof(unsigned char)));
+	checkCuda(cudaMalloc((void**)&probability_vector  , bucket_count*sizeof(double)));
+	checkCuda(cudaMalloc((void**)&cdf_vector  , bucket_count*sizeof(double)));
+        checkCuda(cudaMalloc((void**)&frequency_vector  , bucket_count*sizeof(unsigned int)));
+	checkCuda(cudaMalloc((void**)&cdf_norm,bucket_count*sizeof(double)));
+	checkCuda(cudaMalloc((void**)&eq_hist,bucket_count*sizeof(double)));
+	checkCuda(cudaMalloc((void**)&final_eq,bucket_count*sizeof(double)));
+	checkCuda(cudaMalloc((void**)&lut,bucket_count*sizeof(double)));
+
+
+
+/*
+	for(int i=0;i<width*height;i++)
+	{
+		printf("DATA[%d]=%s\n",i,data[i]);
+	}
+*/
+
+	//Initiliaze probability_cpu to 0
+    	for(int i=0;i<bucket_count;i++)
+	{
+		probability_cpu_int[i]=0;
+	}
+	
+	for(int i =0;i<bucket_count;i++)
+	{
+		probability_cpu_double[i]=0;
+	}	
+
+	
+    	// Copy data to GPU
+    	checkCuda(cudaMemcpy(input_gpu, data,size*sizeof(char), cudaMemcpyHostToDevice));
+	checkCuda(cudaMemset(output_gpu , 0 , size*sizeof(unsigned char)));
+	checkCuda(cudaMemcpy(probability_vector,probability_cpu_double,bucket_count*sizeof(double),cudaMemcpyHostToDevice));
+	checkCuda(cudaMemcpy(frequency_vector,probability_cpu_int,bucket_count*sizeof(unsigned int),cudaMemcpyHostToDevice));
+	checkCuda(cudaMemcpy(eq_hist,probability_cpu_double,bucket_count*sizeof(double),cudaMemcpyHostToDevice));
+
+
+
+	checkCuda(cudaDeviceSynchronize());
+
+    	// Execute algorithm
+
+    	dim3 dimGrid(gridXSize, gridYSize);
+    	dim3 dimBlock(TILE_SIZE, TILE_SIZE);
+
+	// Kernel Call
+	#ifdef CUDA_TIMING
+		float Ktime;
+		TIMER_CREATE(Ktime);
+		TIMER_START(Ktime);
+	#endif
+        
+        // Add more kernels and functions as needed here
+        //norm_function<<<dimGrid, dimBlock>>>(input_gpu, output_gpu,width,height);
+	frequency_function<<<dimGrid, dimBlock>>>(input_gpu,frequency_vector, bucket_size);
+        
+	checkCuda(cudaMemcpy(frequency_cpu,frequency_vector,bucket_count*sizeof(unsigned int),cudaMemcpyDeviceToHost));
+	
+//	int count = 4990464;
+    int count = 0;
+	for(int i=0;i<bucket_count;i++)
+	{
+		count += frequency_cpu[i];
+	} 
+
+	printf("LENGTH = %d\n",count);
+	
+	float alpha = 255/count;	
+
+	lut_cpu[0]=frequency_cpu[0];
+	for(int i=0;i<256;i++)
+	{
+		lut_cpu[i]= lut_cpu[i-1]+ alpha*(float)frequency_cpu[i];
+	}
+
+	checkCuda(cudaMemcpy(lut,lut_cpu,bucket_count*sizeof(double),cudaMemcpyDeviceToHost));
+/*
+	probability_function<<<dimGrid, dimBlock>>>(frequency_vector,probability_vector,count,bucket_count);
+	
+        // From here on, no need to change anything
+        checkCuda(cudaPeekAtLastError());                                     
+        checkCuda(cudaDeviceSynchronize());
+	
+	checkCuda(cudaMemcpy(probability_cpu_double,probability_vector,bucket_count*sizeof(double),cudaMemcpyDeviceToHost));
+
+	int min;
+
+	for(int i=0;i<256;i++)
+	{
+		if(probability_cpu_double[i]>0)
+		{
+			min = i;
+		}	
+	
+	}
+
+	if (max>0 && max <=150)
+	{
+		max = max+100;
+	}
+	else if(max>150 && max <=200)
+	{
+		max = max+50;
+	}
+	else if(max>200 && max<255)
+	{
+		max = max;
+	}
+	
+	printf("MAX = %d",max);
+	
+	//double count = probability_cpu_double[0];
+	cdf_cpu[0]= probability_cpu_double[0];
+	for(int i=1;i<bucket_count;i++)
+	{
+		cdf_cpu[i] = probability_cpu_double[i]+cdf_cpu[i-1];		
+		//count = count+ probability_cpu_double[i];
+	}
+	
+	for(int i= 0;i<256;i++)
+	{
+		printf("probability[%d]=%lf \n",i,probability_cpu_double[i]);
+	
+	}
+
+	for(int i= 0;i<256;i++)
+	{
+		printf("cdf[%d]=%lf\n",i,cdf_cpu[i]);
+	
+	}
+*/	
+	//printf("COUNT = %lf\n",count);
+
+//	checkCuda(cudaMemcpy(cdf_vector,cdf_cpu,bucket_count*sizeof(double),cudaMemcpyHostToDevice));
+
+//	cdf_normalization<<<dimGrid, dimBlock>>>(cdf_vector,cdf_norm,alpha, bucket_count);
+
+//	equalization<<<dimGrid, dimBlock>>>(probability_vector, cdf_norm, eq_hist,bucket_count);
+
+//	final_equalization<<<dimGrid,dimBlock>>>(eq_hist,final_eq,bucket_count);
+
+	final_output<<<dimGrid,dimBlock>>>(input_gpu,output_gpu,lut, bucket_size);
+	#ifdef CUDA_TIMING
+		TIMER_END(Ktime);
+		printf("Kernel Execution Time: %f ms\n", Ktime);
+	#endif
+        checkCuda(cudaPeekAtLastError());                                     
+        checkCuda(cudaDeviceSynchronize());
+	
+	// Retrieve results from the GPU
+	checkCuda(cudaMemcpy(data,output_gpu,size*sizeof(unsigned char),cudaMemcpyDeviceToHost));
+
+    // Free resources and end the program
+	checkCuda(cudaFree(output_gpu));
+	checkCuda(cudaFree(input_gpu));
+	checkCuda(cudaFree(probability_vector));
+	checkCuda(cudaFree(frequency_vector));
+	checkCuda(cudaFree(cdf_vector));
+	checkCuda(cudaFree(cdf_norm));
+
+}
+
+void gpu_warmup(unsigned char *data, unsigned int height,unsigned int width){
+    
+    	unsigned char *input_gpu;
+    	unsigned char *output_gpu;
+     
+	int gridXSize = 1 + (( width - 1) / TILE_SIZE);
+	int gridYSize = 1 + ((height - 1) / TILE_SIZE);
+	
+	int XSize = gridXSize*TILE_SIZE;
+	int YSize = gridYSize*TILE_SIZE;
+	
+	// Both are the same size (CPU/GPU).
+	int size = XSize*YSize;
+	
+	// Allocate arrays in GPU memory
+	checkCuda(cudaMalloc((void**)&input_gpu   , size*sizeof(unsigned char)));
+	checkCuda(cudaMalloc((void**)&output_gpu  , size*sizeof(unsigned char)));
+	
+    	checkCuda(cudaMemset(output_gpu , 0 , size*sizeof(unsigned char)));
+            
+    	// Copy data to GPU
+    	checkCuda(cudaMemcpy(input_gpu, 
+        data, 
+        size*sizeof(char), 
+        cudaMemcpyHostToDevice));
+
+	checkCuda(cudaDeviceSynchronize());
+        
+    // Execute algorithm
+        
+	dim3 dimGrid(gridXSize, gridYSize);
+    	dim3 dimBlock(TILE_SIZE, TILE_SIZE);
+    
+    	warmup<<<dimGrid, dimBlock>>>(input_gpu, 
+                                  output_gpu);
+                                         
+    	checkCuda(cudaDeviceSynchronize());
+        
+	// Retrieve results from the GPU
+	checkCuda(cudaMemcpy(data, 
+			output_gpu, 
+			size*sizeof(unsigned char), 
+			cudaMemcpyDeviceToHost));
+                        
+    	// Free resources and end the program
+	checkCuda(cudaFree(output_gpu));
+	checkCuda(cudaFree(input_gpu));
+			
+	
+}
+
